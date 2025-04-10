@@ -1,0 +1,12 @@
+fastapi
+langchain
+langchain-core
+langchain-experimental
+langchain-huggingface
+langchain-ollama
+langchain-openai
+magika
+pandas
+uvicorn
+python-telegram-bot
+python-dotenv
