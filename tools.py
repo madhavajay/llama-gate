@@ -6,7 +6,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-workspace_dir = Path("/Users/madhavajay/dev/llm-glove/chat/sandbox")
+workspace_dir = Path(__file__).parent / "sandbox"
 
 def sandbox_path(file_path):
     abs_path = Path(file_path).resolve()
