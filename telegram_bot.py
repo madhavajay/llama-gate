@@ -1,4 +1,5 @@
 import os
+import json
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from dotenv import load_dotenv
@@ -6,8 +7,23 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# User registry file path
+USER_REGISTRY_FILE = "user_registry.json"
+
+# Load user registry from file
+def load_user_registry():
+    if os.path.exists(USER_REGISTRY_FILE):
+        with open(USER_REGISTRY_FILE, "r") as file:
+            return json.load(file)
+    return {}
+
+# Save user registry to file
+def save_user_registry():
+    with open(USER_REGISTRY_FILE, "w") as file:
+        json.dump(user_registry, file)
+
 # User registry
-user_registry = {}  # chat_id -> username
+user_registry = load_user_registry()  # chat_id -> username
 
 def get_chat_id(username: str) -> int:
     for chat_id, user in user_registry.items():
@@ -29,6 +45,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Register user
     user_registry[chat_id] = username
+    save_user_registry()
     print(f"Registered user: {username} with chat_id: {chat_id}")
 
     await update.message.reply_text(f"Registered {username} successfully!")

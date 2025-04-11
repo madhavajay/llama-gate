@@ -1,4 +1,5 @@
 import uvicorn
+from collections import deque
 import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -10,6 +11,8 @@ import logging
 from pathlib import Path
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import uuid
+from typing import Dict
 
 from telegram_bot import create_telegram_app, run_telegram_bot, get_chat_id
 from tools import get_tools, tool_mapping
@@ -20,6 +23,24 @@ load_dotenv()
 app = FastAPI()
 current_dir = Path(__file__).parent
 
+
+class CustomUUID(str):
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):
+        from pydantic_core import core_schema
+        return core_schema.no_info_after_validator_function(
+            cls.validate,
+            core_schema.str_schema(),
+            serialization=core_schema.to_string_ser_schema(),
+        )
+
+    @classmethod
+    def validate(cls, v):
+        try:
+            return str(uuid.UUID(v))
+        except ValueError:
+            raise ValueError("Invalid UUID format")
+        
 # Configure logging
 logging.basicConfig(
     filename="server.log",
@@ -68,25 +89,75 @@ async def chat(request: Request):
     with open(current_dir / "html" / "page.html") as f:
         return HTMLResponse(f.read())
 
-@app.post("/ask", include_in_schema=False)
-async def query(request: Request):
-    try:
-        body = await request.json()
-        logger.info(f"Received query: {body}")
-        response = await ask(body["message"])
-        if hasattr(response, "content"):
-            content = response.content
-        elif "content" in response:
-            content = response["content"]
 
-        print("Got response.content", content)
-        print("Got response.content type", type(content))
-        result = {"response": str(content)}
+
+# Queue to store requests
+request_queue: deque['UserQueryQueueItem'] = deque()
+response_queue: deque['UserQueryQueueItem'] = deque()
+
+class UserQuery(BaseModel):
+    query: str
+
+class UserQueryQueueItem(BaseModel):
+    id: CustomUUID
+    query: str
+
+class UserQueryResultPending(BaseModel):
+    status: str
+    message: str
+    request_id: CustomUUID
+
+@app.post("/ask", response_model=UserQueryResultPending, include_in_schema=False)
+async def query(user_query: UserQuery):
+    try:
+        logger.info(f"Received query: {user_query}")
+        
+        # Create queue item with UUID
+        queue_item = UserQueryQueueItem(
+            id=str(uuid.uuid4()),
+            query=user_query.query
+        )
+        
+        # Add request to the queue
+        request_queue.append(queue_item)
+        logger.info(f"Request added to queue: {queue_item}")
+        
+        result = UserQueryResultPending(
+            status="queued", 
+            message="Your request has been added to the queue",
+            request_id=queue_item.id
+        )
         logger.debug(f"Query response: {result}")
-        print(">>> type of result", type(result))
-        return JSONResponse(result)
+        return result
     except Exception as e:
         logger.error(f"Error response: {e}")
+
+@app.get("/list_requests", include_in_schema=False)
+async def list_requests():
+    try:
+        queued_requests = [queue_item.dict() for queue_item in request_queue]
+        logger.info(f"Listing queued requests: {queued_requests}")
+        return JSONResponse({"queued_requests": queued_requests})
+    except Exception as e:
+        logger.error(f"Error listing requests: {e}")
+        return JSONResponse({"status": "error", "message": str(e)})
+
+
+@app.get("/get_request/{request_id}", include_in_schema=False)
+async def get_request(request_id: CustomUUID):
+    try:
+        for queue_item in request_queue:
+            if str(queue_item.id) == request_id:
+                logger.info(f"Found request: {queue_item}")
+                return JSONResponse({
+                    "status": "found", 
+                    "request": queue_item.dict(),
+                    "request_id": str(queue_item.id)
+                })
+        return JSONResponse({"status": "not found", "message": "Request not found in the queue"})
+    except Exception as e:
+        logger.error(f"Error processing request: {e}")
+        return JSONResponse({"status": "error", "message": str(e)})
 
 @app.get("/")
 async def root():
