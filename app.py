@@ -4,7 +4,7 @@ from models import RequestState
 import asyncio
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
 from langchain_ollama import ChatOllama
 import json
 import traceback
@@ -15,11 +15,14 @@ from dotenv import load_dotenv
 import uuid
 from typing import Dict
 from datetime import datetime, timedelta
+from langchain.prompts import ChatPromptTemplate
+from langchain.callbacks import StreamingStdOutCallbackHandler
 
-from telegram_bot import create_telegram_app, run_telegram_bot, get_chat_id, send_notification, pending_approvals, get_first_registered_chat_id
+from telegram_bot import create_telegram_app, run_telegram_bot, get_chat_id, send_notification, get_first_registered_chat_id
 from tools import get_tools, tool_mapping
 from queue_storage import QueueStorage
 from models import UserQuery, UserQueryQueueItem, UserQueryResult, CustomUUID
+from shared_state import pending_approvals  # Import shared state
 
 # Load environment variables
 load_dotenv()
@@ -45,33 +48,72 @@ llm = ChatOllama(
     temperature=0,
 ).bind_tools(get_tools())
 
-async def ask(content):
+async def ask(query: str) -> AIMessage:
+    """Process a user query using the LLM."""
     try:
-        prompt = HumanMessage(content=content)
-        messages = [prompt]
-
-        ai_message = llm.invoke(messages)
-        logger.debug(f"AI message received: {ai_message}")
-        for tool_call in ai_message.tool_calls:
-            selected_tool = tool_mapping[tool_call["name"].lower()]
-            tool_output = selected_tool.invoke(tool_call["args"])
-
-            tool_output_str = json.dumps(tool_output)
-            messages.append(ToolMessage(tool_output_str, tool_call_id=tool_call["id"]))
-
-            logger.debug(f"Tool output: {tool_output_str}")
-
-        for m in messages:
-            logger.debug(f"Message type: {type(m)} - Content: {m}")
-
-        result = llm.invoke(messages)
-        print("Got result", type(result), result)
-        logger.debug(f"Final AI response: {result}")
-        return result
+        # Create a new chat model instance for each query
+        chat_model = ChatOllama(
+            model="llama3.1:8b",
+            temperature=0.1,
+            streaming=True,
+            callbacks=[StreamingStdOutCallbackHandler()]
+        )
+        
+        # Get available tools
+        tools = get_tools()
+        
+        # Create a prompt with tools
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a helpful assistant. Use the available tools to answer the user's query."),
+            ("human", "{input}")
+        ])
+        
+        # Create a chain with the tools
+        chain = prompt | chat_model.bind(tools=tools)
+        
+        # Process the query
+        response = await chain.ainvoke({"input": query})
+        
+        # Check if the response used a tool
+        if hasattr(response, 'additional_kwargs') and 'tool_calls' in response.additional_kwargs:
+            tool_calls = response.additional_kwargs['tool_calls']
+            if tool_calls:
+                # Get the tool that was called
+                tool_name = tool_calls[0]['function']['name']
+                tool_func = tool_mapping.get(tool_name)
+                
+                if tool_func:
+                    # Check if the tool requires approval
+                    requires_approval = getattr(tool_func, '_tool_metadata', {}).get('requires_approval', True)
+                    
+                    if requires_approval:
+                        # Create a queue item for approval
+                        queue_item = UserQueryQueueItem(
+                            id=str(uuid.uuid4()),
+                            query=query
+                        )
+                        
+                        # Add to queue and storage
+                        request_queue.append(queue_item)
+                        request_storage.save_item(queue_item)
+                        
+                        # Send notification for approval
+                        notification_message = (
+                            f"New request queued:\nID: {queue_item.id}\nQuery: {queue_item.query}"
+                        )
+                        await send_notification(telegram_app, notification_message)
+                        
+                        return AIMessage(content=f"Request queued for approval. ID: {queue_item.id}")
+                    else:
+                        # Execute the tool directly without approval
+                        tool_args = json.loads(tool_calls[0]['function']['arguments'])
+                        result = tool_func(**tool_args)
+                        return AIMessage(content=str(result))
+        
+        return response
     except Exception as e:
-        error = {"content": {"status": "error", "message": str(e)}}
-        logger.debug(f"Ask error: {error}. {traceback.format_exc()}")
-        return error
+        logger.error(f"Error processing query: {e}")
+        return AIMessage(content=f"Error processing query: {str(e)}")
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def chat(request: Request):
@@ -131,6 +173,18 @@ async def query(
                             )
                         # If just can_run but not approved, send follow-up message
                         else:
+                            print(f"\n[APP.PY] Processing request {queue_item.id} with can_run=True but not approved")
+                            # Add to pending approvals with the result first
+                            chat_id = get_first_registered_chat_id()
+                            if chat_id:
+                                print(f"[APP.PY] Adding to pending_approvals: chat_id={chat_id}, request_id={queue_item.id}, action=approve_with_result")
+                                # Ensure chat_id is an integer
+                                chat_id = int(chat_id)
+                                pending_approvals[chat_id] = (queue_item.id, queue_item.query, "approve_with_result")
+                                print(f"[APP.PY] Current pending_approvals: {pending_approvals}")
+                            else:
+                                print("[APP.PY] No chat_id found for first registered user!")
+                            
                             # Send follow-up message with the result
                             follow_up_message = (
                                 f"Request processed but not approved:\n"
@@ -139,18 +193,17 @@ async def query(
                                 f"Result: {response.content}\n\n"
                                 "Would you like to approve this result? (y/n)"
                             )
+                            print(f"[APP.PY] Sending follow-up message: {follow_up_message}")
                             await send_notification(telegram_app, follow_up_message)
                             
-                            # Add to pending approvals with the result
-                            chat_id = get_first_registered_chat_id()
-                            if chat_id:
-                                pending_approvals[chat_id] = (queue_item.id, queue_item.query, "approve_with_result")
-                            
                             # Continue waiting for final approval/rejection
+                            print(f"[APP.PY] Starting wait loop for final approval/rejection")
                             while (datetime.now() - start_time).total_seconds() < wait_time_secs:
                                 stored_item = request_storage.load_item(queue_item.id)
                                 if stored_item:
+                                    print(f"[APP.PY] Checking stored item state: {stored_item.state}")
                                     if stored_item.state == RequestState.APPROVED:
+                                        print(f"[APP.PY] Request {queue_item.id} was approved, returning result")
                                         return UserQueryResult(
                                             status=RequestState.APPROVED,
                                             message="Request approved and processed",
@@ -159,6 +212,7 @@ async def query(
                                             result=response.content
                                         )
                                     elif stored_item.state == RequestState.REJECTED:
+                                        print(f"[APP.PY] Request {queue_item.id} was rejected")
                                         return UserQueryResult(
                                             status=RequestState.REJECTED,
                                             message="Request was rejected",
@@ -167,7 +221,7 @@ async def query(
                                         )
                                 await asyncio.sleep(1)
                             
-                            # If we timed out waiting for approval/rejection
+                            print(f"[APP.PY] Timed out waiting for approval/rejection of request {queue_item.id}")
                             return UserQueryResult(
                                 status=RequestState.PENDING,
                                 message="Request processed, waiting for approval",
@@ -177,7 +231,7 @@ async def query(
                     elif stored_item.state == RequestState.REJECTED:
                         return UserQueryResult(
                             status=RequestState.REJECTED,
-                            message="Request was rejected",
+                        message="Request was rejected",
                             request_id=queue_item.id,
                             query=user_query.query
                         )
@@ -237,12 +291,15 @@ async def get_request(request_id: CustomUUID):
             request_dict = stored_item.model_dump()
             request_dict['created_at'] = request_dict['created_at'].isoformat()
             
+            # Only include result if the request is approved
+            result = stored_item.result if (stored_item.state == RequestState.APPROVED and hasattr(stored_item, 'result')) else None
+            
             return JSONResponse({
                 "status": stored_item.state,
                 "message": "Request found",
                 "request_id": str(stored_item.id),
                 "query": stored_item.query,
-                "result": stored_item.result if hasattr(stored_item, 'result') else None
+                "result": result
             })
         
         # If not in storage, check in-memory queue
@@ -251,12 +308,16 @@ async def get_request(request_id: CustomUUID):
                 logger.info(f"Found request in memory: {queue_item}")
                 request_dict = queue_item.model_dump()
                 request_dict['created_at'] = request_dict['created_at'].isoformat()
+                
+                # Only include result if the request is approved
+                result = queue_item.result if (queue_item.state == RequestState.APPROVED and hasattr(queue_item, 'result')) else None
+                
                 return JSONResponse({
                     "status": queue_item.state,
                     "message": "Request found",
                     "request_id": str(queue_item.id),
                     "query": queue_item.query,
-                    "result": queue_item.result if hasattr(queue_item, 'result') else None
+                    "result": result
                 })
             
         return JSONResponse({"status": "not found", "message": "Request not found in the queue"})

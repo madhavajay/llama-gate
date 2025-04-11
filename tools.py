@@ -36,18 +36,6 @@ def list_all_files_in_datasite() -> FileInfo:
     return results
 
 @tool
-def list_all_files_in_private() -> FileInfo:
-    """
-    Recursively lists all files in a directory and gathers metadata for each file.
-
-    Returns:
-        dict: A dictionary where each key is the file path and the value is another dictionary containing
-              file metadata (hash, extension, size in MB, MIME type, and Magika group).
-    """
-    results = list_files_with_metadata(workspace_dir)
-    return results
-
-@tool
 def get_csv_columns_and_types(csv_path) -> str:
     """
     Reads a CSV file using pandas and returns a dictionary containing
@@ -98,7 +86,6 @@ tool_mapping = {
     "list_all_files_in_datasite": list_all_files_in_datasite,
     "get_csv_columns_and_types": get_csv_columns_and_types,
     "get_csv_head_as_dict": get_csv_head_as_dict,
-    "list_all_files_in_private": list_all_files_in_private,
 }
 
 def get_tools():

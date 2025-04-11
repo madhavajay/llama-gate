@@ -1,8 +1,9 @@
 from enum import Enum
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Union
 import uuid
 from pydantic_core import core_schema
+from datetime import datetime
 
 class CustomUUID(str):
     @classmethod
@@ -37,6 +38,9 @@ class UserQueryQueueItem(BaseModel):
     id: str
     query: str
     state: RequestState = RequestState.PENDING
+    can_run: bool = False
+    created_at: datetime = Field(default_factory=datetime.now)
+    result: Optional[str] = None
 
 class UserQueryResult(BaseModel):
     status: RequestState = RequestState.PENDING  # can be "PENDING", "APPROVED", "REJECTED"

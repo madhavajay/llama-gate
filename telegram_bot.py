@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import re
 from typing import Optional
 from models import RequestState  # Import RequestState from models
+from shared_state import pending_approvals, user_registry  # Import shared state
 
 # Load environment variables
 load_dotenv()
@@ -17,25 +18,24 @@ USER_REGISTRY_FILE = "user_registry.json"
 def load_user_registry():
     if os.path.exists(USER_REGISTRY_FILE):
         with open(USER_REGISTRY_FILE, "r") as file:
-            return json.load(file)
+            # Convert string keys to integers when loading from JSON
+            return {int(k): v for k, v in json.load(file).items()}
     return {}
 
 # Save user registry to file
 def save_user_registry():
+    # Convert integer keys to strings when saving to JSON
     with open(USER_REGISTRY_FILE, "w") as file:
-        json.dump(user_registry, file)
+        json.dump({str(k): v for k, v in user_registry.items()}, file)
 
-# User registry
-user_registry = load_user_registry()  # chat_id -> username
-
-# Dictionary to store pending approvals
-pending_approvals = {}  # chat_id -> (request_id, query, action)
+# Initialize user registry
+user_registry.update(load_user_registry())
 
 def get_first_registered_chat_id() -> int:
     """Get the chat ID of the first registered user."""
     if not user_registry:
         return None
-    return next(iter(user_registry.keys()))
+    return int(next(iter(user_registry.keys())))  # Ensure chat_id is an integer
 
 def get_chat_id(username: str) -> int:
     for chat_id, user in user_registry.items():
@@ -64,7 +64,7 @@ async def hello(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    chat_id = update.effective_chat.id
+    chat_id = int(update.effective_chat.id)  # Ensure chat_id is an integer
     username = user.username or user.first_name
 
     # Register user
@@ -75,7 +75,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Registered {username} successfully!")
 
 async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
+    chat_id = int(update.effective_chat.id)  # Ensure chat_id is an integer
     
     if not context.args:
         await update.message.reply_text("Please provide a request ID or query to approve. Usage: /approve <request_id_or_query>")
@@ -93,11 +93,14 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     await update.message.reply_text(
         f"Found request:\nID: {request_id}\nQuery: {query}\n\n"
-        "Would you like to approve this request? (y/n)"
+        "Would you like to:\n"
+        "y - Approve and run\n"
+        "r - Run without approving\n"
+        "n - Cancel"
     )
 
 async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
+    chat_id = int(update.effective_chat.id)  # Ensure chat_id is an integer
     
     if not context.args:
         await update.message.reply_text("Please provide a request ID or query to reject. Usage: /reject <request_id_or_query>")
@@ -119,33 +122,94 @@ async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def handle_approval_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
+    chat_id = int(update.effective_chat.id)  # Ensure chat_id is an integer
+    user_response = update.message.text.lower()
+    
+    print(f"\n[TELEGRAM_BOT] Received response: {user_response} from chat_id: {chat_id}")
+    print(f"[TELEGRAM_BOT] Current pending_approvals: {pending_approvals}")
     
     if chat_id not in pending_approvals:
+        print(f"[TELEGRAM_BOT] No pending approval found for chat_id: {chat_id}")
+        await update.message.reply_text("No pending approval found.")
         return
     
-    response = update.message.text.lower()
     request_id, query, action = pending_approvals[chat_id]
+    print(f"[TELEGRAM_BOT] Found pending approval: request_id={request_id}, action={action}")
     
-    if response == 'y':
-        # Process the request based on action type
-        from queue_storage import QueueStorage
-        request_storage = QueueStorage("storage/requests")
-        
-        if action == "approve":
-            request_storage.update_item_state(request_id, RequestState.APPROVED)
-            await update.message.reply_text(f"Request approved:\nID: {request_id}\nQuery: {query}")
-        else:  # reject
-            request_storage.update_item_state(request_id, RequestState.REJECTED)
-            await update.message.reply_text(f"Request rejected:\nID: {request_id}\nQuery: {query}")
-    elif response == 'n':
-        await update.message.reply_text("Action cancelled.")
-    else:
-        await update.message.reply_text("Please respond with 'y' for yes or 'n' for no.")
+    # Update the request in the queue
+    from queue_storage import QueueStorage
+    request_storage = QueueStorage("storage/requests")
+    
+    # Get the current request
+    request = request_storage.load_item(request_id)
+    if not request:
+        print(f"[TELEGRAM_BOT] Could not find request {request_id} in storage")
+        await update.message.reply_text("Request not found in storage.")
+        del pending_approvals[chat_id]
         return
     
-    # Clear the pending approval
+    print(f"[TELEGRAM_BOT] Found request in storage, current state: {request.state}")
+    
+    # For approve_with_result, only accept y/n
+    if action == "approve_with_result":
+        print(f"[TELEGRAM_BOT] Handling approve_with_result action")
+        if user_response not in ['y', 'n']:
+            print(f"[TELEGRAM_BOT] Invalid response for approve_with_result: {user_response}")
+            await update.message.reply_text("Please respond with 'y' or 'n'.")
+            return
+        
+        if user_response == 'y':
+            print(f"[TELEGRAM_BOT] Setting request {request_id} to APPROVED")
+            request.state = RequestState.APPROVED
+            await update.message.reply_text("Request approved.")
+        else:  # n
+            print(f"[TELEGRAM_BOT] Setting request {request_id} to REJECTED")
+            request.state = RequestState.REJECTED
+            await update.message.reply_text("Request rejected.")
+        
+        print(f"[TELEGRAM_BOT] Saving request with new state: {request.state}")
+        request_storage.save_item(request)
+        print(f"[TELEGRAM_BOT] Removing pending approval for chat_id: {chat_id}")
+        del pending_approvals[chat_id]
+        print(f"[TELEGRAM_BOT] Updated pending_approvals: {pending_approvals}")
+        return
+    
+    # For regular approvals, accept y/r/n
+    if user_response not in ['y', 'n', 'r']:
+        print(f"[TELEGRAM_BOT] Invalid response for regular approval: {user_response}")
+        await update.message.reply_text("Please respond with 'y', 'r', or 'n'.")
+        return
+    
+    if user_response == 'n':
+        print(f"[TELEGRAM_BOT] Cancelling action for request {request_id}")
+        del pending_approvals[chat_id]
+        await update.message.reply_text("Action cancelled.")
+        return
+    
+    # If request is already approved, just set can_run and proceed
+    if request.state == RequestState.APPROVED:
+        print(f"[TELEGRAM_BOT] Request {request_id} is already approved, setting can_run=True")
+        request.can_run = True
+        request_storage.save_item(request)
+        del pending_approvals[chat_id]
+        await update.message.reply_text("Request is already approved and will be processed.")
+        return
+    
+    request.can_run = True
+    if user_response == 'y':
+        print(f"[TELEGRAM_BOT] Setting request {request_id} to APPROVED")
+        request.state = RequestState.APPROVED
+        await update.message.reply_text("Request approved and will be processed.")
+    else:  # r
+        print(f"[TELEGRAM_BOT] Setting request {request_id} to can_run=True without approval")
+        await update.message.reply_text("Request will be processed without approval.")
+    
+    print(f"[TELEGRAM_BOT] Saving request with new state: {request.state}, can_run: {request.can_run}")
+    request_storage.save_item(request)
+    
+    print(f"[TELEGRAM_BOT] Removing pending approval for chat_id: {chat_id}")
     del pending_approvals[chat_id]
+    print(f"[TELEGRAM_BOT] Updated pending_approvals: {pending_approvals}")
 
 async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """List all pending requests."""
