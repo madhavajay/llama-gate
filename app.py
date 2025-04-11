@@ -62,73 +62,39 @@ async def ask(query: str) -> AIMessage:
             temperature=0.1,
             streaming=True,
             callbacks=[StreamingStdOutCallbackHandler()]
-        )
+        ).bind_tools(get_tools())  # Bind tools to the chat model
         
-        # Get available tools and convert them to the format Ollama expects
-        tools = get_tools()
-        print(f"[ASK] Available tools: {[type(tool).__name__ for tool in tools]}")
+        # Create initial message
+        prompt = HumanMessage(content=query)
+        messages = [prompt]
         
-        # Convert tools to the format Ollama expects
-        ollama_tools = []
-        for tool in tools:
-            tool_dict = {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.args_schema.schema()
-            }
-            ollama_tools.append(tool_dict)
+        # Get first response from LLM
+        print("[ASK] Invoking LLM with initial message")
+        ai_message = await chat_model.ainvoke(messages)
+        print(f"[ASK] AI message received: {ai_message}")
         
-        print(f"[ASK] Converted tools: {ollama_tools}")
-        
-        # Create a prompt with tools
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful assistant. Use the available tools to answer the user's query."),
-            ("human", "{input}")
-        ])
-        
-        # Create a chain with the tools
-        chain = prompt | chat_model.bind(tools=ollama_tools)
-        
-        # Process the query
-        print("[ASK] Invoking chain with query")
-        response = await chain.ainvoke({"input": query})
-        print(f"[ASK] Response type: {type(response)}")
-        print(f"[ASK] Response content: {response.content}")
-        print(f"[ASK] Response additional_kwargs: {response.additional_kwargs}")
-        
-        # Check if the response used a tool
-        if hasattr(response, 'additional_kwargs') and 'tool_calls' in response.additional_kwargs:
-            print("[ASK] Found tool_calls in response")
-            tool_calls = response.additional_kwargs['tool_calls']
-            print(f"[ASK] Tool calls type: {type(tool_calls)}")
-            print(f"[ASK] Tool calls: {tool_calls}")
-            
-            if tool_calls:
-                # Get the tool that was called
-                tool_call = tool_calls[0]
-                print(f"[ASK] Tool call type: {type(tool_call)}")
+        # Process tool calls if any
+        if hasattr(ai_message, 'tool_calls') and ai_message.tool_calls:
+            print("[ASK] Processing tool calls")
+            for tool_call in ai_message.tool_calls:
                 print(f"[ASK] Tool call: {tool_call}")
+                selected_tool = tool_mapping[tool_call["name"].lower()]
+                print(f"[ASK] Selected tool: {selected_tool}")
                 
-                tool_name = tool_call['function']['name'].lower()  # Convert to lowercase
-                print(f"[ASK] Tool name: {tool_name}")
+                tool_output = selected_tool.invoke(tool_call["args"])
+                print(f"[ASK] Tool output: {tool_output}")
                 
-                tool_func = tool_mapping.get(tool_name)
-                print(f"[ASK] Tool func type: {type(tool_func)}")
-                print(f"[ASK] Tool func: {tool_func}")
-                
-                if tool_func:
-                    # Execute the tool directly
-                    tool_args = json.loads(tool_call['function']['arguments'])
-                    print(f"[ASK] Tool args: {tool_args}")
-                    result = tool_func.invoke(tool_args)  # Use invoke method
-                    print(f"[ASK] Tool result: {result}")
-                    
-                    # Create a new AIMessage with the tool result
-                    result_message = AIMessage(content=str(result))
-                    print(f"[ASK] Result message: {result_message}")
-                    return result_message
+                tool_output_str = json.dumps(tool_output)
+                messages.append(ToolMessage(tool_output_str, tool_call_id=tool_call["id"]))
+                print(f"[ASK] Added tool message to conversation")
+            
+            # Get final response with tool outputs
+            print("[ASK] Getting final response with tool outputs")
+            result = await chat_model.ainvoke(messages)
+            print(f"[ASK] Final result: {result}")
+            return result
         
-        return response
+        return ai_message
     except Exception as e:
         print(f"[ASK] Error details: {type(e)} - {str(e)}")
         print(f"[ASK] Error traceback: {traceback.format_exc()}")
