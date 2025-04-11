@@ -149,22 +149,26 @@ async def query(
 @app.get("/list_requests", include_in_schema=False)
 async def list_requests():
     try:
-        # Get items from both memory and storage
-        # Note: Using model_dump() instead of dict() for Pydantic v2 compatibility
-        # Do not change this back to dict() as it will be removed in Pydantic v3
-        memory_items = [queue_item.model_dump() for queue_item in request_queue]
-        storage_items = [item.model_dump() for item in request_storage.list_items()]
+        # Get items from storage only
+        storage_items = []
+        for item in request_storage.list_items():
+            # Verify the item still exists in storage
+            if request_storage.load_item(item.id):
+                storage_items.append(item.model_dump())
         
-        # Combine and deduplicate items
-        all_items = {item['id']: item for item in memory_items + storage_items}
-        queued_requests = list(all_items.values())
+        # Group requests by state
+        grouped_requests = {
+            RequestState.PENDING.value: [],
+            RequestState.APPROVED.value: [],
+            RequestState.REJECTED.value: []
+        }
         
-        # Include the state in the JSON output
-        for request in queued_requests:
-            request['state'] = request.get('state', RequestState.PENDING.value)
+        for request in storage_items:
+            state = request.get('state', RequestState.PENDING.value)
+            grouped_requests[state].append(request)
         
-        logger.info(f"Listing queued requests: {queued_requests}")
-        return JSONResponse({"queued_requests": queued_requests})
+        logger.info(f"Listing grouped requests: {grouped_requests}")
+        return JSONResponse({"grouped_requests": grouped_requests})
     except Exception as e:
         logger.error(f"Error listing requests: {e}")
         return JSONResponse({"status": "error", "message": str(e)})

@@ -211,6 +211,42 @@
       height: 16px;
       fill: currentColor;
     }
+
+    .request-card {
+      background: #2a2a2a;
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 1rem;
+      margin: 1rem 0;
+      position: relative;
+    }
+
+    .request-id {
+      position: absolute;
+      top: 0.5rem;
+      right: 0.5rem;
+      background: #1a1a1a;
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      color: #888;
+    }
+
+    .request-query {
+      margin-right: 4rem;
+      color: #e0e0e0;
+    }
+
+    .status-header {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
+
+    .status-emoji {
+      font-size: 1.2rem;
+    }
   </style>
 </head>
 
@@ -234,7 +270,57 @@
     const chatContainer = document.getElementById("chat-container");
     const userInput = document.getElementById("user-input");
 
-    // Add initial welcome message and help text to chat
+    // Add this at the top with other global variables
+    let knownUUIDs = new Set();
+
+    // Update the formatRequests function
+    function formatRequests(requests, status) {
+      if (requests.length === 0) {
+        return `<br><div class="status-header"><span class="status-emoji">${getStatusEmoji(status)}</span><strong>${status}:</strong></div> No ${status.toLowerCase()} requests.`;
+      }
+      let formatted = `<br><div class="status-header"><span class="status-emoji">${getStatusEmoji(status)}</span><strong>${status}:</strong></div>`;
+      requests.forEach(item => {
+        // Add UUID to known UUIDs for autocomplete
+        knownUUIDs.add(item.id);
+
+        formatted += `
+          <div class="request-card">
+            <div class="request-id">ID: <code>${item.id}</code></div>
+            <div class="request-query">${item.query}</div>
+          </div>
+        `;
+      });
+      return formatted;
+    }
+
+    function getStatusEmoji(status) {
+      switch (status) {
+        case "PENDING": return "⏳";
+        case "APPROVED": return "✅";
+        case "REJECTED": return "❌";
+        default: return "ℹ️";
+      }
+    }
+
+    // Add autocomplete functionality
+    userInput.addEventListener("input", function () {
+      const text = this.value;
+      if (text.startsWith("/get ")) {
+        const partialUUID = text.slice(5).toLowerCase();
+        const matchingUUIDs = Array.from(knownUUIDs).filter(uuid =>
+          uuid.toLowerCase().includes(partialUUID)
+        );
+
+        if (matchingUUIDs.length === 1) {
+          const fullUUID = matchingUUIDs[0];
+          if (text.slice(5) !== fullUUID) {
+            this.value = `/get ${fullUUID}`;
+          }
+        }
+      }
+    });
+
+    // Update the window.onload function to include known UUIDs
     window.onload = function () {
       appendMessage(
         "<strong>Welcome to SyftBox Chat!</strong><br>Hi there! I'm here to assist you with any questions you have. Type your message below and press Enter or click 'Send' to get started." +
@@ -245,9 +331,12 @@
         "def get_csv_head_as_dict(csv_path) -> dict:</code></small><br><br>" +
         "You can also use these commands:<br>" +
         "<code>/list</code> - List all queued requests<br>" +
-        "<code>/get [uuid]</code> - Get status of a specific request",
+        "<code>/get [uuid]</code> - Get status of a specific request (autocompletes after /list)",
         "assistant",
       );
+
+      // Focus the textarea
+      userInput.focus();
     };
 
     // Auto-expand textarea
@@ -293,7 +382,7 @@
           response = await fetch("/list_requests");
           data = await response.json();
           loadingDiv.remove();
-          displayQueueList(data.queued_requests);
+          displayQueueList(data);
         } else if (message.startsWith("/get ")) {
           const uuid = message.split(" ")[1];
           response = await fetch(`/get_request/${uuid}`);
@@ -339,16 +428,61 @@
       appendMessage(message, "assistant");
     }
 
-    function displayQueueList(requests) {
-      let message = "<strong>Queued Requests:</strong><br>";
-      if (requests.length === 0) {
-        message += "No requests in the queue.";
-      } else {
-        requests.forEach(item => {
-          message += `<br>ID: <code>${item.id}</code><br>`;
-          message += `Query: ${item.query}<br>`;
-        });
+    function displayQueueList(data) {
+      let message = "<strong>Requests:</strong><br>";
+
+      // Clear the known UUIDs cache
+      knownUUIDs.clear();
+
+      // Helper function to process requests and update cache
+      function processRequests(requests) {
+        if (requests && requests.length > 0) {
+          requests.forEach(item => {
+            knownUUIDs.add(item.id);
+          });
+          return true;
+        }
+        return false;
       }
+
+      let hasRequests = false;
+
+      // Handle both old and new response formats
+      if (data.grouped_requests) {
+        // New format with grouped requests
+        hasRequests = processRequests(data.grouped_requests.PENDING) ||
+          processRequests(data.grouped_requests.APPROVED) ||
+          processRequests(data.grouped_requests.REJECTED);
+
+        message += formatRequests(data.grouped_requests.PENDING, "PENDING");
+        message += formatRequests(data.grouped_requests.APPROVED, "APPROVED");
+        message += formatRequests(data.grouped_requests.REJECTED, "REJECTED");
+      } else if (data.queued_requests) {
+        // Old format - group requests by state
+        const grouped = {
+          PENDING: [],
+          APPROVED: [],
+          REJECTED: []
+        };
+
+        data.queued_requests.forEach(request => {
+          const state = request.state || "PENDING";
+          grouped[state].push(request);
+        });
+
+        hasRequests = processRequests(grouped.PENDING) ||
+          processRequests(grouped.APPROVED) ||
+          processRequests(grouped.REJECTED);
+
+        message += formatRequests(grouped.PENDING, "PENDING");
+        message += formatRequests(grouped.APPROVED, "APPROVED");
+        message += formatRequests(grouped.REJECTED, "REJECTED");
+      }
+
+      if (!hasRequests) {
+        message += "<br>No requests found.";
+      }
+
       appendMessage(message, "assistant");
     }
 
@@ -373,6 +507,9 @@
     }
 
     function formatResponse(text) {
+      if (typeof text !== 'string') {
+        text = JSON.stringify(text, null, 2);
+      }
       // Convert markdown-style code blocks to HTML
       return text
         .replace(
