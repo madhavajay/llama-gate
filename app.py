@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 import uuid
 from typing import Dict
 
-from telegram_bot import create_telegram_app, run_telegram_bot, get_chat_id
+from telegram_bot import create_telegram_app, run_telegram_bot, get_chat_id, send_notification
 from tools import get_tools, tool_mapping
 from queue_storage import QueueStorage
 from models import UserQuery, UserQueryQueueItem, UserQueryResultPending, CustomUUID
@@ -96,6 +96,10 @@ async def query(user_query: UserQuery):
         request_queue.append(queue_item)
         request_storage.save_item(queue_item)
         logger.info(f"Request added to queue: {queue_item}")
+        
+        # Send Telegram notification
+        notification_message = f"New request queued:\nID: {queue_item.id}\nQuery: {queue_item.query}"
+        await send_notification(telegram_app, notification_message)
         
         result = UserQueryResultPending(
             status="queued", 

@@ -25,6 +25,12 @@ def save_user_registry():
 # User registry
 user_registry = load_user_registry()  # chat_id -> username
 
+def get_first_registered_chat_id() -> int:
+    """Get the chat ID of the first registered user."""
+    if not user_registry:
+        return None
+    return next(iter(user_registry.keys()))
+
 def get_chat_id(username: str) -> int:
     for chat_id, user in user_registry.items():
         if user == username:
@@ -68,4 +74,19 @@ async def run_telegram_bot(telegram_app):
     print("Telegram bot started")
     # Keeps the bot alive (like run_polling)
     await telegram_app.updater.start_polling()
-    await telegram_app.updater.wait_until_closed() 
+    await telegram_app.updater.wait_until_closed()
+
+# Function to send notification
+async def send_notification(telegram_app, message: str) -> bool:
+    """Send a notification to the first registered user."""
+    chat_id = get_first_registered_chat_id()
+    if not chat_id:
+        print("No registered users to send notification to")
+        return False
+    
+    try:
+        await telegram_app.bot.send_message(chat_id=chat_id, text=message)
+        return True
+    except Exception as e:
+        print(f"Error sending notification: {e}")
+        return False 
