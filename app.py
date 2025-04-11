@@ -49,7 +49,7 @@ llm = ChatOllama(
 ).bind_tools(get_tools())
 
 # Bypass flag for approval system
-BYPASS_APPROVAL = True  # Set to True to skip approval process
+BYPASS_APPROVAL = False  # Set to True to skip approval process
 
 async def ask(query: str) -> AIMessage:
     """Process a user query using the LLM."""
