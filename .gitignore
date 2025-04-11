@@ -176,3 +176,4 @@ cython_debug/
 
 file_metadata_cache.json
 sandbox/*
+storage/

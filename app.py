@@ -16,6 +16,8 @@ from typing import Dict
 
 from telegram_bot import create_telegram_app, run_telegram_bot, get_chat_id
 from tools import get_tools, tool_mapping
+from queue_storage import QueueStorage
+from models import UserQuery, UserQueryQueueItem, UserQueryResultPending, CustomUUID
 
 # Load environment variables
 load_dotenv()
@@ -23,24 +25,10 @@ load_dotenv()
 app = FastAPI()
 current_dir = Path(__file__).parent
 
+# Initialize queue storage
+request_storage = QueueStorage("storage/requests")
+response_storage = QueueStorage("storage/responses")
 
-class CustomUUID(str):
-    @classmethod
-    def __get_pydantic_core_schema__(cls, source_type, handler):
-        from pydantic_core import core_schema
-        return core_schema.no_info_after_validator_function(
-            cls.validate,
-            core_schema.str_schema(),
-            serialization=core_schema.to_string_ser_schema(),
-        )
-
-    @classmethod
-    def validate(cls, v):
-        try:
-            return str(uuid.UUID(v))
-        except ValueError:
-            raise ValueError("Invalid UUID format")
-        
 # Configure logging
 logging.basicConfig(
     filename="server.log",
@@ -89,23 +77,9 @@ async def chat(request: Request):
     with open(current_dir / "html" / "page.html") as f:
         return HTMLResponse(f.read())
 
-
-
 # Queue to store requests
 request_queue: deque['UserQueryQueueItem'] = deque()
 response_queue: deque['UserQueryQueueItem'] = deque()
-
-class UserQuery(BaseModel):
-    query: str
-
-class UserQueryQueueItem(BaseModel):
-    id: CustomUUID
-    query: str
-
-class UserQueryResultPending(BaseModel):
-    status: str
-    message: str
-    request_id: CustomUUID
 
 @app.post("/ask", response_model=UserQueryResultPending, include_in_schema=False)
 async def query(user_query: UserQuery):
@@ -118,8 +92,9 @@ async def query(user_query: UserQuery):
             query=user_query.query
         )
         
-        # Add request to the queue
+        # Add request to the queue and storage
         request_queue.append(queue_item)
+        request_storage.save_item(queue_item)
         logger.info(f"Request added to queue: {queue_item}")
         
         result = UserQueryResultPending(
@@ -135,25 +110,43 @@ async def query(user_query: UserQuery):
 @app.get("/list_requests", include_in_schema=False)
 async def list_requests():
     try:
-        queued_requests = [queue_item.dict() for queue_item in request_queue]
+        # Get items from both memory and storage
+        memory_items = [queue_item.dict() for queue_item in request_queue]
+        storage_items = [item.dict() for item in request_storage.list_items()]
+        
+        # Combine and deduplicate items
+        all_items = {item['id']: item for item in memory_items + storage_items}
+        queued_requests = list(all_items.values())
+        
         logger.info(f"Listing queued requests: {queued_requests}")
         return JSONResponse({"queued_requests": queued_requests})
     except Exception as e:
         logger.error(f"Error listing requests: {e}")
         return JSONResponse({"status": "error", "message": str(e)})
 
-
 @app.get("/get_request/{request_id}", include_in_schema=False)
 async def get_request(request_id: CustomUUID):
     try:
+        # Check in-memory queue first
         for queue_item in request_queue:
             if str(queue_item.id) == request_id:
-                logger.info(f"Found request: {queue_item}")
+                logger.info(f"Found request in memory: {queue_item}")
                 return JSONResponse({
                     "status": "found", 
                     "request": queue_item.dict(),
                     "request_id": str(queue_item.id)
                 })
+        
+        # Check storage
+        stored_item = request_storage.load_item(request_id)
+        if stored_item:
+            logger.info(f"Found request in storage: {stored_item}")
+            return JSONResponse({
+                "status": "found",
+                "request": stored_item.dict(),
+                "request_id": str(stored_item.id)
+            })
+            
         return JSONResponse({"status": "not found", "message": "Request not found in the queue"})
     except Exception as e:
         logger.error(f"Error processing request: {e}")
@@ -162,7 +155,6 @@ async def get_request(request_id: CustomUUID):
 @app.get("/")
 async def root():
     return {"message": "FastAPI is working!"}
-
 
 # Endpoint to send a message
 @app.get("/send-message")
