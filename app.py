@@ -2,7 +2,7 @@ import uvicorn
 from collections import deque
 from models import RequestState
 import asyncio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_ollama import ChatOllama
@@ -14,11 +14,12 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import uuid
 from typing import Dict
+from datetime import datetime, timedelta
 
 from telegram_bot import create_telegram_app, run_telegram_bot, get_chat_id, send_notification
 from tools import get_tools, tool_mapping
 from queue_storage import QueueStorage
-from models import UserQuery, UserQueryQueueItem, UserQueryResultPending, CustomUUID
+from models import UserQuery, UserQueryQueueItem, UserQueryResult, CustomUUID
 
 # Load environment variables
 load_dotenv()
@@ -65,6 +66,7 @@ async def ask(content):
             logger.debug(f"Message type: {type(m)} - Content: {m}")
 
         result = llm.invoke(messages)
+        print("Got result", type(result), result)
         logger.debug(f"Final AI response: {result}")
         return result
     except Exception as e:
@@ -82,8 +84,11 @@ async def chat(request: Request):
 request_queue: deque['UserQueryQueueItem'] = deque()
 response_queue: deque['UserQueryQueueItem'] = deque()
 
-@app.post("/ask", response_model=UserQueryResultPending, include_in_schema=False)
-async def query(user_query: UserQuery):
+@app.post("/ask", response_model=UserQueryResult, include_in_schema=False)
+async def query(
+    user_query: UserQuery,
+    wait_time_secs: int = Query(default=20, description="Time to wait for approval in seconds")
+):
     try:
         logger.info(f"Received query: {user_query}")
         
@@ -102,15 +107,44 @@ async def query(user_query: UserQuery):
         notification_message = f"New request queued:\nID: {queue_item.id}\nQuery: {queue_item.query}"
         await send_notification(telegram_app, notification_message)
         
-        result = UserQueryResultPending(
-            status="queued", 
+        # Wait for approval/rejection if wait_time_secs > 0
+        if wait_time_secs > 0:
+            start_time = datetime.now()
+            while (datetime.now() - start_time).total_seconds() < wait_time_secs:
+                # Check request status
+                stored_item = request_storage.load_item(queue_item.id)
+                if stored_item and stored_item.state != RequestState.PENDING:
+                    if stored_item.state == RequestState.APPROVED:
+                        # Run the ask function on the approved request
+                        response = await ask(user_query.query)
+                        return UserQueryResult(
+                            status=RequestState.APPROVED,
+                            message="Request approved and processed",
+                            request_id=queue_item.id,
+                            query=user_query.query,
+                            result=response.content
+                        )
+                    elif stored_item.state == RequestState.REJECTED:
+                        return UserQueryResult(
+                            status=RequestState.REJECTED,
+                            message="Request was rejected",
+                            request_id=queue_item.id,
+                            query=user_query.query
+                        )
+                await asyncio.sleep(1)  # Check every second
+        
+        # If we get here, either wait_time_secs was 0 or we timed out
+        result = UserQueryResult(
+            status=RequestState.PENDING, 
             message="Your request has been added to the queue",
-            request_id=queue_item.id
+            request_id=queue_item.id,
+            query=user_query.query
         )
         logger.debug(f"Query response: {result}")
         return result
     except Exception as e:
         logger.error(f"Error response: {e}")
+        raise
 
 @app.get("/list_requests", include_in_schema=False)
 async def list_requests():

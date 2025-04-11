@@ -326,9 +326,13 @@
 
     function displayQueueItem(data) {
       let message = "";
-      if (data.status === "queued") {
+      if (data.status === "PENDING") {
         message = `Your request has been queued with ID: <code>${data.request_id}</code><br>`;
         message += `Use <code>/get ${data.request_id}</code> to check its status.`;
+      } else if (data.status === "APPROVED" && data.result) {
+        message = formatResponse(data.result);
+      } else if (data.status === "REJECTED") {
+        message = "Your request was rejected.";
       } else {
         message = formatResponse(data.message);
       }

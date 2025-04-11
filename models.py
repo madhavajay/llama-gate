@@ -38,7 +38,9 @@ class UserQueryQueueItem(BaseModel):
     query: str
     state: RequestState = RequestState.PENDING
 
-class UserQueryResultPending(BaseModel):
-    status: str
+class UserQueryResult(BaseModel):
+    status: RequestState = RequestState.PENDING  # can be "PENDING", "APPROVED", "REJECTED"
     message: str
-    request_id: str 
+    request_id: str
+    query: str
+    result: Optional[str] = None 
