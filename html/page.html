@@ -247,11 +247,64 @@
     .status-emoji {
       font-size: 1.2rem;
     }
+
+    .wait-time-container {
+      position: absolute;
+      top: 1rem;
+      right: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: #2a2a2a;
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      border: 1px solid #333;
+    }
+
+    .wait-time-container label {
+      color: #888;
+      font-size: 0.9rem;
+    }
+
+    .wait-time-container input {
+      width: 50px;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      color: #e0e0e0;
+      padding: 0.25rem;
+      border-radius: 4px;
+      text-align: center;
+    }
+
+    .countdown {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .countdown-spinner {
+      width: 16px;
+      height: 16px;
+      border: 2px solid rgba(255, 255, 255, 0.3);
+      border-top-color: white;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
   </style>
 </head>
 
 <body>
   <div id="app">
+    <div class="wait-time-container">
+      <label for="wait-time">Wait (secs):</label>
+      <input type="number" id="wait-time" value="60" min="1" max="300">
+    </div>
     <div id="chat-container"></div>
     <div id="input-container">
       <div class="input-wrapper">
@@ -269,6 +322,9 @@
   <script>
     const chatContainer = document.getElementById("chat-container");
     const userInput = document.getElementById("user-input");
+    const waitTimeInput = document.getElementById("wait-time");
+    let countdownInterval = null;
+    let currentWaitTime = 60;
 
     // Add this at the top with other global variables
     let knownUUIDs = new Set();
@@ -353,6 +409,51 @@
       }
     });
 
+    function updateSubmitButton(seconds) {
+      const button = document.querySelector('button');
+      if (seconds > 0) {
+        button.innerHTML = `
+          <div class="countdown">
+            <div class="countdown-spinner"></div>
+            <span>${seconds}s</span>
+          </div>
+          Cancel
+        `;
+        button.onclick = cancelWait;
+      } else {
+        button.innerHTML = `
+          <svg class="send-icon" viewBox="0 0 24 24">
+            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+          </svg>
+          Send
+        `;
+        button.onclick = sendMessage;
+      }
+    }
+
+    function startCountdown(seconds) {
+      currentWaitTime = seconds;
+      updateSubmitButton(seconds);
+
+      countdownInterval = setInterval(() => {
+        currentWaitTime--;
+        updateSubmitButton(currentWaitTime);
+
+        if (currentWaitTime <= 0) {
+          clearInterval(countdownInterval);
+          countdownInterval = null;
+        }
+      }, 1000);
+    }
+
+    function cancelWait() {
+      if (countdownInterval) {
+        clearInterval(countdownInterval);
+        countdownInterval = null;
+      }
+      updateSubmitButton(0);
+    }
+
     async function sendMessage() {
       const message = userInput.value.trim();
       if (!message) return;
@@ -361,6 +462,10 @@
       appendMessage(message, "user");
       userInput.value = "";
       userInput.style.height = "auto";
+
+      // Start countdown
+      const waitTime = parseInt(waitTimeInput.value) || 60;
+      startCountdown(waitTime);
 
       // Add loading indicator
       const loadingDiv = document.createElement("div");
@@ -383,12 +488,14 @@
           data = await response.json();
           loadingDiv.remove();
           displayQueueList(data);
+          cancelWait();
         } else if (message.startsWith("/get ")) {
           const uuid = message.split(" ")[1];
           response = await fetch(`/get_request/${uuid}`);
           data = await response.json();
           loadingDiv.remove();
           displayRequestStatus(data);
+          cancelWait();
         } else {
           // Regular chat message
           response = await fetch("/ask", {
@@ -396,12 +503,16 @@
             headers: {
               "Content-Type": "application/json",
             },
-            body: JSON.stringify({ query: message }),
+            body: JSON.stringify({
+              query: message,
+              wait_time_secs: waitTime
+            }),
           });
 
           data = await response.json();
           loadingDiv.remove();
           displayQueueItem(data);
+          cancelWait();
         }
       } catch (error) {
         loadingDiv.remove();
@@ -410,6 +521,7 @@
           "assistant",
         );
         console.error("Error:", error);
+        cancelWait();
       }
     }
 
