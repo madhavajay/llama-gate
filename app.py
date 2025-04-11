@@ -1,5 +1,6 @@
 import uvicorn
 from collections import deque
+from models import RequestState
 import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -115,12 +116,18 @@ async def query(user_query: UserQuery):
 async def list_requests():
     try:
         # Get items from both memory and storage
-        memory_items = [queue_item.dict() for queue_item in request_queue]
-        storage_items = [item.dict() for item in request_storage.list_items()]
+        # Note: Using model_dump() instead of dict() for Pydantic v2 compatibility
+        # Do not change this back to dict() as it will be removed in Pydantic v3
+        memory_items = [queue_item.model_dump() for queue_item in request_queue]
+        storage_items = [item.model_dump() for item in request_storage.list_items()]
         
         # Combine and deduplicate items
         all_items = {item['id']: item for item in memory_items + storage_items}
         queued_requests = list(all_items.values())
+        
+        # Include the state in the JSON output
+        for request in queued_requests:
+            request['state'] = request.get('state', RequestState.PENDING.value)
         
         logger.info(f"Listing queued requests: {queued_requests}")
         return JSONResponse({"queued_requests": queued_requests})
