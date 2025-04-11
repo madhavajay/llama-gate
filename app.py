@@ -48,9 +48,14 @@ llm = ChatOllama(
     temperature=0,
 ).bind_tools(get_tools())
 
+# Bypass flag for approval system
+BYPASS_APPROVAL = True  # Set to True to skip approval process
+
 async def ask(query: str) -> AIMessage:
     """Process a user query using the LLM."""
     try:
+        print(f"\n[ASK] Starting query processing for: {query}")
+        
         # Create a new chat model instance for each query
         chat_model = ChatOllama(
             model="llama3.1:8b",
@@ -59,8 +64,21 @@ async def ask(query: str) -> AIMessage:
             callbacks=[StreamingStdOutCallbackHandler()]
         )
         
-        # Get available tools
+        # Get available tools and convert them to the format Ollama expects
         tools = get_tools()
+        print(f"[ASK] Available tools: {[type(tool).__name__ for tool in tools]}")
+        
+        # Convert tools to the format Ollama expects
+        ollama_tools = []
+        for tool in tools:
+            tool_dict = {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.args_schema.schema()
+            }
+            ollama_tools.append(tool_dict)
+        
+        print(f"[ASK] Converted tools: {ollama_tools}")
         
         # Create a prompt with tools
         prompt = ChatPromptTemplate.from_messages([
@@ -69,49 +87,51 @@ async def ask(query: str) -> AIMessage:
         ])
         
         # Create a chain with the tools
-        chain = prompt | chat_model.bind(tools=tools)
+        chain = prompt | chat_model.bind(tools=ollama_tools)
         
         # Process the query
+        print("[ASK] Invoking chain with query")
         response = await chain.ainvoke({"input": query})
+        print(f"[ASK] Response type: {type(response)}")
+        print(f"[ASK] Response content: {response.content}")
+        print(f"[ASK] Response additional_kwargs: {response.additional_kwargs}")
         
         # Check if the response used a tool
         if hasattr(response, 'additional_kwargs') and 'tool_calls' in response.additional_kwargs:
+            print("[ASK] Found tool_calls in response")
             tool_calls = response.additional_kwargs['tool_calls']
+            print(f"[ASK] Tool calls type: {type(tool_calls)}")
+            print(f"[ASK] Tool calls: {tool_calls}")
+            
             if tool_calls:
                 # Get the tool that was called
-                tool_name = tool_calls[0]['function']['name']
+                tool_call = tool_calls[0]
+                print(f"[ASK] Tool call type: {type(tool_call)}")
+                print(f"[ASK] Tool call: {tool_call}")
+                
+                tool_name = tool_call['function']['name'].lower()  # Convert to lowercase
+                print(f"[ASK] Tool name: {tool_name}")
+                
                 tool_func = tool_mapping.get(tool_name)
+                print(f"[ASK] Tool func type: {type(tool_func)}")
+                print(f"[ASK] Tool func: {tool_func}")
                 
                 if tool_func:
-                    # Check if the tool requires approval
-                    requires_approval = getattr(tool_func, '_tool_metadata', {}).get('requires_approval', True)
+                    # Execute the tool directly
+                    tool_args = json.loads(tool_call['function']['arguments'])
+                    print(f"[ASK] Tool args: {tool_args}")
+                    result = tool_func.invoke(tool_args)  # Use invoke method
+                    print(f"[ASK] Tool result: {result}")
                     
-                    if requires_approval:
-                        # Create a queue item for approval
-                        queue_item = UserQueryQueueItem(
-                            id=str(uuid.uuid4()),
-                            query=query
-                        )
-                        
-                        # Add to queue and storage
-                        request_queue.append(queue_item)
-                        request_storage.save_item(queue_item)
-                        
-                        # Send notification for approval
-                        notification_message = (
-                            f"New request queued:\nID: {queue_item.id}\nQuery: {queue_item.query}"
-                        )
-                        await send_notification(telegram_app, notification_message)
-                        
-                        return AIMessage(content=f"Request queued for approval. ID: {queue_item.id}")
-                    else:
-                        # Execute the tool directly without approval
-                        tool_args = json.loads(tool_calls[0]['function']['arguments'])
-                        result = tool_func(**tool_args)
-                        return AIMessage(content=str(result))
+                    # Create a new AIMessage with the tool result
+                    result_message = AIMessage(content=str(result))
+                    print(f"[ASK] Result message: {result_message}")
+                    return result_message
         
         return response
     except Exception as e:
+        print(f"[ASK] Error details: {type(e)} - {str(e)}")
+        print(f"[ASK] Error traceback: {traceback.format_exc()}")
         logger.error(f"Error processing query: {e}")
         return AIMessage(content=f"Error processing query: {str(e)}")
 
@@ -132,7 +152,22 @@ async def query(
 ):
     try:
         print(f"Received query: {user_query}")
-        print(f"Wait time received: {wait_time_secs} seconds")  # Log the wait time
+        print(f"Wait time received: {wait_time_secs} seconds")
+        
+        if BYPASS_APPROVAL:
+            print("[APP.PY] Bypassing approval system")
+            # Directly process the query
+            response = await ask(user_query.query)
+            print(f"[APP.PY] Response from ask: {response}")
+            print(f"[APP.PY] Response content: {response.content}")
+            
+            return UserQueryResult(
+                status=RequestState.APPROVED,
+                message="Request processed (approval bypassed)",
+                request_id=str(uuid.uuid4()),
+                query=user_query.query,
+                result=response.content
+            )
         
         # Create queue item with UUID
         queue_item = UserQueryQueueItem(
@@ -157,13 +192,21 @@ async def query(
                 stored_item = request_storage.load_item(queue_item.id)
                 if stored_item:
                     if stored_item.can_run:
+                        print(f"\n[APP.PY] Processing request {queue_item.id} with can_run=True")
                         # Run the ask function on the request
                         response = await ask(user_query.query)
+                        print(f"[APP.PY] Response from ask: {response}")
+                        print(f"[APP.PY] Response content: {response.content}")
+                        
                         # Update the stored item with the result
                         stored_item.result = response.content
+                        print(f"[APP.PY] Updated stored item result: {stored_item.result}")
                         request_storage.save_item(stored_item)
+                        print(f"[APP.PY] Saved item to storage with result: {stored_item.result}")
+                        
                         # If approved, return the result immediately
                         if stored_item.state == RequestState.APPROVED:
+                            print(f"[APP.PY] Request {queue_item.id} is approved, returning result")
                             return UserQueryResult(
                                 status=RequestState.APPROVED,
                                 message="Request approved and processed",
@@ -231,7 +274,7 @@ async def query(
                     elif stored_item.state == RequestState.REJECTED:
                         return UserQueryResult(
                             status=RequestState.REJECTED,
-                        message="Request was rejected",
+                            message="Request was rejected",
                             request_id=queue_item.id,
                             query=user_query.query
                         )

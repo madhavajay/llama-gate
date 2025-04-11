@@ -233,6 +233,44 @@ async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     await update.message.reply_text(message)
 
+async def force_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approve all pending requests and allow them to execute."""
+    from queue_storage import QueueStorage
+    request_storage = QueueStorage("storage/requests")
+    
+    print(f"\n[FORCE_APPROVE] Starting force approve process")
+    
+    # Get all items and filter for pending ones
+    all_items = request_storage.list_items()
+    print(f"[FORCE_APPROVE] Found {len(all_items)} total items in storage")
+    
+    pending_requests = [
+        item for item in all_items
+        if item.state == RequestState.PENDING
+    ]
+    
+    print(f"[FORCE_APPROVE] Found {len(pending_requests)} pending requests")
+    
+    if not pending_requests:
+        await update.message.reply_text("No pending requests found.")
+        return
+    
+    # Approve all pending requests
+    approved_count = 0
+    for request in pending_requests:
+        print(f"[FORCE_APPROVE] Processing request: {request.id}")
+        print(f"[FORCE_APPROVE] Current state: {request.state}")
+        
+        request.state = RequestState.APPROVED
+        request.can_run = True
+        request_storage.save_item(request)
+        approved_count += 1
+        
+        print(f"[FORCE_APPROVE] Updated state: {request.state}, can_run: {request.can_run}")
+    
+    print(f"[FORCE_APPROVE] Completed. Approved {approved_count} requests")
+    await update.message.reply_text(f"Approved {approved_count} pending requests. They will now be processed.")
+
 # Initialize and configure the telegram bot
 def create_telegram_app():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -245,6 +283,7 @@ def create_telegram_app():
     app.add_handler(CommandHandler("approve", approve))
     app.add_handler(CommandHandler("reject", reject))
     app.add_handler(CommandHandler("list", list_requests))
+    app.add_handler(CommandHandler("force_approve", force_approve))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_approval_response))
     return app
 
