@@ -86,10 +86,11 @@ response_queue: deque['UserQueryQueueItem'] = deque()
 @app.post("/ask", response_model=UserQueryResult, include_in_schema=False)
 async def query(
     user_query: UserQuery,
-    wait_time_secs: int = Query(default=20, description="Time to wait for approval in seconds")
+    wait_time_secs: int = Query(default=60, description="Time to wait for approval in seconds")
 ):
     try:
-        logger.info(f"Received query: {user_query}")
+        print(f"Received query: {user_query}")
+        print(f"Wait time received: {wait_time_secs} seconds")  # Log the wait time
         
         # Create queue item with UUID
         queue_item = UserQueryQueueItem(
@@ -119,7 +120,6 @@ async def query(
                         # Update the stored item with the result
                         stored_item.result = response.content
                         request_storage.save_item(stored_item)
-                        
                         # If approved, return the result immediately
                         if stored_item.state == RequestState.APPROVED:
                             return UserQueryResult(
@@ -146,6 +146,28 @@ async def query(
                             if chat_id:
                                 pending_approvals[chat_id] = (queue_item.id, queue_item.query, "approve_with_result")
                             
+                            # Continue waiting for final approval/rejection
+                            while (datetime.now() - start_time).total_seconds() < wait_time_secs:
+                                stored_item = request_storage.load_item(queue_item.id)
+                                if stored_item:
+                                    if stored_item.state == RequestState.APPROVED:
+                                        return UserQueryResult(
+                                            status=RequestState.APPROVED,
+                                            message="Request approved and processed",
+                                            request_id=queue_item.id,
+                                            query=user_query.query,
+                                            result=response.content
+                                        )
+                                    elif stored_item.state == RequestState.REJECTED:
+                                        return UserQueryResult(
+                                            status=RequestState.REJECTED,
+                                            message="Request was rejected",
+                                            request_id=queue_item.id,
+                                            query=user_query.query
+                                        )
+                                await asyncio.sleep(1)
+                            
+                            # If we timed out waiting for approval/rejection
                             return UserQueryResult(
                                 status=RequestState.PENDING,
                                 message="Request processed, waiting for approval",
