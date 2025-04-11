@@ -488,12 +488,19 @@
 
     function displayRequestStatus(data) {
       let message = "";
-      if (data.status === "found") {
+      if (data.status === "not found") {
+        message = `Request not found. Please check the ID and try again.`;
+      } else if (data.status === "error") {
+        message = `Error: ${data.message}`;
+      } else {
         message = `<strong>Request Status:</strong><br>`;
         message += `ID: <code>${data.request_id}</code><br>`;
-        message += `Query: ${data.request.query}<br>`;
-      } else {
-        message = `Request not found. Please check the ID and try again.`;
+        message += `Query: ${data.query}<br>`;
+        message += `State: ${data.status}<br>`;
+        if (data.result) {
+          message += `<br><strong>Result:</strong><br>`;
+          message += formatResponse(data.result);
+        }
       }
       appendMessage(message, "assistant");
     }

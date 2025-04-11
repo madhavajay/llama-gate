@@ -16,7 +16,7 @@ import uuid
 from typing import Dict
 from datetime import datetime, timedelta
 
-from telegram_bot import create_telegram_app, run_telegram_bot, get_chat_id, send_notification
+from telegram_bot import create_telegram_app, run_telegram_bot, get_chat_id, send_notification, pending_approvals, get_first_registered_chat_id
 from tools import get_tools, tool_mapping
 from queue_storage import QueueStorage
 from models import UserQuery, UserQueryQueueItem, UserQueryResult, CustomUUID
@@ -29,7 +29,6 @@ current_dir = Path(__file__).parent
 
 # Initialize queue storage
 request_storage = QueueStorage("storage/requests")
-response_storage = QueueStorage("storage/responses")
 
 # Configure logging
 logging.basicConfig(
@@ -113,17 +112,46 @@ async def query(
             while (datetime.now() - start_time).total_seconds() < wait_time_secs:
                 # Check request status
                 stored_item = request_storage.load_item(queue_item.id)
-                if stored_item and stored_item.state != RequestState.PENDING:
-                    if stored_item.state == RequestState.APPROVED:
-                        # Run the ask function on the approved request
+                if stored_item:
+                    if stored_item.can_run:
+                        # Run the ask function on the request
                         response = await ask(user_query.query)
-                        return UserQueryResult(
-                            status=RequestState.APPROVED,
-                            message="Request approved and processed",
-                            request_id=queue_item.id,
-                            query=user_query.query,
-                            result=response.content
-                        )
+                        # Update the stored item with the result
+                        stored_item.result = response.content
+                        request_storage.save_item(stored_item)
+                        
+                        # If approved, return the result immediately
+                        if stored_item.state == RequestState.APPROVED:
+                            return UserQueryResult(
+                                status=RequestState.APPROVED,
+                                message="Request approved and processed",
+                                request_id=queue_item.id,
+                                query=user_query.query,
+                                result=response.content
+                            )
+                        # If just can_run but not approved, send follow-up message
+                        else:
+                            # Send follow-up message with the result
+                            follow_up_message = (
+                                f"Request processed but not approved:\n"
+                                f"ID: {queue_item.id}\n"
+                                f"Query: {queue_item.query}\n"
+                                f"Result: {response.content}\n\n"
+                                "Would you like to approve this result? (y/n)"
+                            )
+                            await send_notification(telegram_app, follow_up_message)
+                            
+                            # Add to pending approvals with the result
+                            chat_id = get_first_registered_chat_id()
+                            if chat_id:
+                                pending_approvals[chat_id] = (queue_item.id, queue_item.query, "approve_with_result")
+                            
+                            return UserQueryResult(
+                                status=RequestState.PENDING,
+                                message="Request processed, waiting for approval",
+                                request_id=queue_item.id,
+                                query=user_query.query
+                            )
                     elif stored_item.state == RequestState.REJECTED:
                         return UserQueryResult(
                             status=RequestState.REJECTED,
@@ -149,12 +177,10 @@ async def query(
 @app.get("/list_requests", include_in_schema=False)
 async def list_requests():
     try:
-        # Get items from storage only
-        storage_items = []
-        for item in request_storage.list_items():
-            # Verify the item still exists in storage
-            if request_storage.load_item(item.id):
-                storage_items.append(item.model_dump())
+        # Get all items from storage
+        print("Attempting to retrieve all items from storage.")
+        storage_items = request_storage.list_items()
+        print(f"Retrieved {len(storage_items)} items from storage.")
         
         # Group requests by state
         grouped_requests = {
@@ -164,37 +190,52 @@ async def list_requests():
         }
         
         for request in storage_items:
-            state = request.get('state', RequestState.PENDING.value)
-            grouped_requests[state].append(request)
+            state = request.state
+            print(f"Processing request with ID: {request.id}, State: {state}")
+            # Convert the request to a dictionary and handle datetime serialization
+            request_dict = request.model_dump()
+            request_dict['created_at'] = request_dict['created_at'].isoformat()
+            grouped_requests[state].append(request_dict)
         
         logger.info(f"Listing grouped requests: {grouped_requests}")
+        print(f"Grouped requests: {grouped_requests}")
         return JSONResponse({"grouped_requests": grouped_requests})
     except Exception as e:
         logger.error(f"Error listing requests: {e}")
+        print(f"Error occurred: {e}")
         return JSONResponse({"status": "error", "message": str(e)})
 
 @app.get("/get_request/{request_id}", include_in_schema=False)
 async def get_request(request_id: CustomUUID):
     try:
-        # Check in-memory queue first
-        for queue_item in request_queue:
-            if str(queue_item.id) == request_id:
-                logger.info(f"Found request in memory: {queue_item}")
-                return JSONResponse({
-                    "status": "found", 
-                    "request": queue_item.dict(),
-                    "request_id": str(queue_item.id)
-                })
-        
-        # Check storage
+        # Check storage first since it has the final state
         stored_item = request_storage.load_item(request_id)
         if stored_item:
             logger.info(f"Found request in storage: {stored_item}")
+            request_dict = stored_item.model_dump()
+            request_dict['created_at'] = request_dict['created_at'].isoformat()
+            
             return JSONResponse({
-                "status": "found",
-                "request": stored_item.dict(),
-                "request_id": str(stored_item.id)
+                "status": stored_item.state,
+                "message": "Request found",
+                "request_id": str(stored_item.id),
+                "query": stored_item.query,
+                "result": stored_item.result if hasattr(stored_item, 'result') else None
             })
+        
+        # If not in storage, check in-memory queue
+        for queue_item in request_queue:
+            if str(queue_item.id) == request_id:
+                logger.info(f"Found request in memory: {queue_item}")
+                request_dict = queue_item.model_dump()
+                request_dict['created_at'] = request_dict['created_at'].isoformat()
+                return JSONResponse({
+                    "status": queue_item.state,
+                    "message": "Request found",
+                    "request_id": str(queue_item.id),
+                    "query": queue_item.query,
+                    "result": queue_item.result if hasattr(queue_item, 'result') else None
+                })
             
         return JSONResponse({"status": "not found", "message": "Request not found in the queue"})
     except Exception as e:
@@ -235,6 +276,34 @@ async def main():
     # Clean shutdown
     await telegram_app.stop()
     await telegram_app.shutdown()
+
+async def process_requests():
+    while True:
+        try:
+            # Get all pending requests
+            requests = request_storage.get_all_items()
+            
+            for request in requests:
+                # Only process requests that are marked to run
+                if request.can_run:
+                    try:
+                        # Process the request
+                        result = await process_request(request)
+                        
+                        # Update the request with the result
+                        request.result = result
+                        request_storage.update_item(request.id, request)
+                        
+                        logger.info(f"Processed request {request.id}")
+                    except Exception as e:
+                        logger.error(f"Error processing request {request.id}: {str(e)}")
+                        request.result = f"Error processing request: {str(e)}"
+                        request_storage.update_item(request.id, request)
+            
+            await asyncio.sleep(1)  # Check every second
+        except Exception as e:
+            logger.error(f"Error in process_requests: {str(e)}")
+            await asyncio.sleep(1)  # Wait before retrying
 
 if __name__ == "__main__":
     asyncio.run(main())
